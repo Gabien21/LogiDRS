@@ -16,20 +16,16 @@
 """ Multiple choice fine-tuning: utilities to work with multiple choice tasks of reading comprehension """
 
 
-import csv
-import glob
-import ast
+import numpy as np
 import json
 import logging
 import os
-import jsonlines
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
-from textblob import TextBlob
-
+from typing import List, Dict, Optional
+import jsonlines
+import gensim
 import tqdm
-
 from filelock import FileLock
 from transformers import PreTrainedTokenizer, is_tf_available, is_torch_available
 
@@ -60,15 +56,15 @@ class InputExample:
 
 @dataclass(frozen=True)
 class InputFeatures:
-    """
-    A single set of features of data.
-    Property names are the same names as the corresponding inputs to a model.
-    """
-
     example_id: str
     input_ids: List[List[int]]
     attention_mask: Optional[List[List[int]]]
     token_type_ids: Optional[List[List[int]]]
+    passage_mask: Optional[List[int]]
+    question_mask: Optional[List[int]]
+    argument_bpe_ids: Optional[List[List[int]]]
+    domain_bpe_ids: Optional[List[List[int]]]
+    punct_bpe_ids: Optional[List[List[int]]]
     label: Optional[int]
 
 
@@ -82,7 +78,7 @@ if is_torch_available():
     import torch
     from torch.utils.data.dataset import Dataset
 
-    class MultipleChoiceDataset(Dataset):
+    class MyMultipleChoiceDataset(Dataset):
         """
         This will be superseded by a framework-agnostic approach
         soon.
@@ -94,25 +90,33 @@ if is_torch_available():
             self,
             data_dir: str,
             tokenizer: PreTrainedTokenizer,
+            arg_tokenizer,
+            data_processing_version: int,
+            graph_building_block_version: int,
+            relations,
+            punctuations,
             task: str,
             max_seq_length: Optional[int] = None,
+            max_ngram: int = 5,
             overwrite_cache=False,
             mode: Split = Split.train,
-            demo=False
+            demo=False,
         ):
             processor = processors[task]()
 
-
             if not os.path.isdir(os.path.join(data_dir, "cached_data")):
                 os.mkdir(os.path.join(data_dir, "cached_data"))
+
             cached_features_file = os.path.join(
                 data_dir,
                 "cached_data",
-                "cached_{}_{}_{}_{}{}".format(
+                "dagn_cached_{}_{}_{}_{}_dataprov{}_graphv{}{}".format(
                     mode.value,
                     tokenizer.__class__.__name__,
                     str(max_seq_length),
                     task,
+                    data_processing_version,
+                    graph_building_block_version,
                     "_demo" if demo else ""
                 ),
             )
@@ -135,17 +139,25 @@ if is_torch_available():
                             examples = processor.get_dev_examples(data_dir)
                     elif mode == Split.test:
                         examples = processor.get_test_examples(data_dir)
-                    else:
+                    elif mode == Split.train:
                         if demo:
                             examples = processor.get_train_demos(data_dir)
                         else:
                             examples = processor.get_train_examples(data_dir)
+                    else:
+                        raise Exception()
                     logger.info("Training examples: %s", len(examples))
-                    self.features = convert_examples_to_features(
+
+
+                    self.features = convert_examples_to_arg_features(
                         examples,
                         label_list,
+                        arg_tokenizer,
+                        relations,
+                        punctuations,
                         max_seq_length,
                         tokenizer,
+                        max_ngram
                     )
                     logger.info("Saving features into cached file %s", cached_features_file)
                     torch.save(self.features, cached_features_file)
@@ -156,93 +168,6 @@ if is_torch_available():
         def __getitem__(self, i) -> InputFeatures:
             return self.features[i]
 
-
-if is_tf_available():
-    import tensorflow as tf
-
-    class TFMultipleChoiceDataset:
-        """
-        This will be superseded by a framework-agnostic approach
-        soon.
-        """
-
-        features: List[InputFeatures]
-
-        def __init__(
-            self,
-            data_dir: str,
-            tokenizer: PreTrainedTokenizer,
-            task: str,
-            max_seq_length: Optional[int] = 128,
-            overwrite_cache=False,
-            mode: Split = Split.train,
-        ):
-            processor = processors[task]()
-
-            logger.info(f"Creating features from dataset file at {data_dir}")
-            label_list = processor.get_labels()
-            if mode == Split.dev:
-                examples = processor.get_dev_examples(data_dir)
-            elif mode == Split.test:
-                examples = processor.get_test_examples(data_dir)
-            else:
-                examples = processor.get_train_examples(data_dir)
-            logger.info("Training examples: %s", len(examples))
-
-            self.features = convert_examples_to_features(
-                examples,
-                label_list,
-                max_seq_length,
-                tokenizer,
-            )
-
-            def gen():
-                for (ex_index, ex) in tqdm.tqdm(enumerate(self.features), desc="convert examples to features"):
-                    if ex_index % 10000 == 0:
-                        logger.info("Writing example %d of %d" % (ex_index, len(examples)))
-
-                    yield (
-                        {
-                            "example_id": 0,
-                            "input_ids": ex.input_ids,
-                            "attention_mask": ex.attention_mask,
-                            "token_type_ids": ex.token_type_ids,
-                        },
-                        ex.label,
-                    )
-
-            self.dataset = tf.data.Dataset.from_generator(
-                gen,
-                (
-                    {
-                        "example_id": tf.int32,
-                        "input_ids": tf.int32,
-                        "attention_mask": tf.int32,
-                        "token_type_ids": tf.int32,
-                    },
-                    tf.int64,
-                ),
-                (
-                    {
-                        "example_id": tf.TensorShape([]),
-                        "input_ids": tf.TensorShape([None, None]),
-                        "attention_mask": tf.TensorShape([None, None]),
-                        "token_type_ids": tf.TensorShape([None, None]),
-                    },
-                    tf.TensorShape([]),
-                ),
-            )
-
-        def get_dataset(self):
-            self.dataset = self.dataset.apply(tf.data.experimental.assert_cardinality(len(self.features)))
-
-            return self.dataset
-
-        def __len__(self):
-            return len(self.features)
-
-        def __getitem__(self, i) -> InputFeatures:
-            return self.features[i]
 
 
 class DataProcessor:
@@ -265,260 +190,6 @@ class DataProcessor:
         raise NotImplementedError()
 
 
-class RaceProcessor(DataProcessor):
-    """Processor for the RACE data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        high = os.path.join(data_dir, "train/high")
-        middle = os.path.join(data_dir, "train/middle")
-        high = self._read_txt(high)
-        middle = self._read_txt(middle)
-        return self._create_examples(high + middle, "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        high = os.path.join(data_dir, "dev/high")
-        middle = os.path.join(data_dir, "dev/middle")
-        high = self._read_txt(high)
-        middle = self._read_txt(middle)
-        return self._create_examples(high + middle, "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} test".format(data_dir))
-        high = os.path.join(data_dir, "test/high")
-        middle = os.path.join(data_dir, "test/middle")
-        high = self._read_txt(high)
-        middle = self._read_txt(middle)
-        return self._create_examples(high + middle, "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3"]
-
-    def _read_txt(self, input_dir):
-        lines = []
-        files = glob.glob(input_dir + "/*txt")
-        for file in tqdm.tqdm(files, desc="read files"):
-            with open(file, "r", encoding="utf-8") as fin:
-                data_raw = json.load(fin)
-                data_raw["race_id"] = file
-                lines.append(data_raw)
-        return lines
-
-    def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
-        examples = []
-        for (_, data_raw) in enumerate(lines):
-            race_id = "%s-%s" % (set_type, data_raw["race_id"])
-            article = data_raw["article"]
-            for i in range(len(data_raw["answers"])):
-                truth = str(ord(data_raw["answers"][i]) - ord("A"))
-                question = data_raw["questions"][i]
-                options = data_raw["options"][i]
-
-                examples.append(
-                    InputExample(
-                        example_id=race_id,
-                        question=question,
-                        contexts=[article, article, article, article],  # this is not efficient but convenient
-                        endings=[options[0], options[1], options[2], options[3]],
-                        label=truth,
-                    )
-                )
-        return examples
-
-
-class SynonymProcessor(DataProcessor):
-    """Processor for the Synonym data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "mctrain.csv")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "mchp.csv")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "mctest.csv")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3", "4"]
-
-    def _read_csv(self, input_file):
-        with open(input_file, "r", encoding="utf-8") as f:
-            return list(csv.reader(f))
-
-    def _create_examples(self, lines: List[List[str]], type: str):
-        """Creates examples for the training and dev sets."""
-
-        examples = [
-            InputExample(
-                example_id=line[0],
-                question="",  # in the swag dataset, the
-                # common beginning of each
-                # choice is stored in "sent2".
-                contexts=[line[1], line[1], line[1], line[1], line[1]],
-                endings=[line[2], line[3], line[4], line[5], line[6]],
-                label=line[7],
-            )
-            for line in lines  # we skip the line with the column names
-        ]
-
-        return examples
-
-
-class SwagProcessor(DataProcessor):
-    """Processor for the SWAG data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.csv")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "val.csv")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        raise ValueError(
-            "For swag testing, the input file does not contain a label column. It can not be tested in current code"
-            "setting!"
-        )
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.csv")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3"]
-
-    def _read_csv(self, input_file):
-        with open(input_file, "r", encoding="utf-8") as f:
-            return list(csv.reader(f))
-
-    def _create_examples(self, lines: List[List[str]], type: str):
-        """Creates examples for the training and dev sets."""
-        if type == "train" and lines[0][-1] != "label":
-            raise ValueError("For training, the input file must contain a label column.")
-
-        examples = [
-            InputExample(
-                example_id=line[2],
-                question=line[5],  # in the swag dataset, the
-                # common beginning of each
-                # choice is stored in "sent2".
-                contexts=[line[4], line[4], line[4], line[4]],
-                endings=[line[7], line[8], line[9], line[10]],
-                label=line[11],
-            )
-            for line in lines[1:]  # we skip the line with the column names
-        ]
-
-        return examples
-
-
-class ArcProcessor(DataProcessor):
-    """Processor for the ARC data set (request from allennlp)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_json(os.path.join(data_dir, "train.jsonl")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_json(os.path.join(data_dir, "dev.jsonl")), "dev")
-
-    def get_test_examples(self, data_dir):
-        logger.info("LOOKING AT {} test".format(data_dir))
-        return self._create_examples(self._read_json(os.path.join(data_dir, "test.jsonl")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3"]
-
-    def _read_json(self, input_file):
-        with open(input_file, "r", encoding="utf-8") as fin:
-            lines = fin.readlines()
-            return lines
-
-    def _create_examples(self, lines, type):
-        """Creates examples for the training and dev sets."""
-
-        # There are two types of labels. They should be normalized
-        def normalize(truth):
-            if truth in "ABCD":
-                return ord(truth) - ord("A")
-            elif truth in "1234":
-                return int(truth) - 1
-            else:
-                logger.info("truth ERROR! %s", str(truth))
-                return None
-
-        examples = []
-        three_choice = 0
-        four_choice = 0
-        five_choice = 0
-        other_choices = 0
-        # we deleted example which has more than or less than four choices
-        for line in tqdm.tqdm(lines, desc="read arc data"):
-            data_raw = json.loads(line.strip("\n"))
-            if len(data_raw["question"]["choices"]) == 3:
-                three_choice += 1
-                continue
-            elif len(data_raw["question"]["choices"]) == 5:
-                five_choice += 1
-                continue
-            elif len(data_raw["question"]["choices"]) != 4:
-                other_choices += 1
-                continue
-            four_choice += 1
-            truth = str(normalize(data_raw["answerKey"]))
-            assert truth != "None"
-            question_choices = data_raw["question"]
-            question = question_choices["stem"]
-            id = data_raw["id"]
-            options = question_choices["choices"]
-            if len(options) == 4:
-                examples.append(
-                    InputExample(
-                        example_id=id,
-                        question=question,
-                        contexts=[
-                            options[0]["para"].replace("_", ""),
-                            options[1]["para"].replace("_", ""),
-                            options[2]["para"].replace("_", ""),
-                            options[3]["para"].replace("_", ""),
-                        ],
-                        endings=[options[0]["text"], options[1]["text"], options[2]["text"], options[3]["text"]],
-                        label=truth,
-                    )
-                )
-
-        if type == "train":
-            assert len(examples) > 1
-            assert examples[0].label is not None
-        logger.info("len examples: %s}", str(len(examples)))
-        logger.info("Three choices: %s", str(three_choice))
-        logger.info("Five choices: %s", str(five_choice))
-        logger.info("Other choices: %s", str(other_choices))
-        logger.info("four choices: %s", str(four_choice))
-
-        return examples
-
 
 class ReclorProcessor(DataProcessor):
     """Processor for the ReClor data set."""
@@ -528,7 +199,7 @@ class ReclorProcessor(DataProcessor):
         logger.info("LOOKING AT {} train".format(data_dir))
         return self._create_examples(self._read_json(os.path.join(data_dir, "train.json")), "train")
 
-    def get_train_demos(self, data_dir):  # Eleanor.
+    def get_train_demos(self, data_dir):  
         """See base class."""
         logger.info("LOOKING AT {} train".format(data_dir))
         return self._create_examples(self._read_json(os.path.join(data_dir, "100_train.json")), "train")
@@ -538,7 +209,7 @@ class ReclorProcessor(DataProcessor):
         logger.info("LOOKING AT {} dev".format(data_dir))
         return self._create_examples(self._read_json(os.path.join(data_dir, "val.json")), "dev")
 
-    def get_dev_demos(self, data_dir):  # Eleanor.
+    def get_dev_demos(self, data_dir):  
         """See base class."""
         logger.info("LOOKING AT {} dev".format(data_dir))
         return self._create_examples(self._read_json(os.path.join(data_dir, "100_val.json")), "dev")
@@ -582,6 +253,68 @@ class ReclorProcessor(DataProcessor):
                 )
         return examples
 
+class LogiQA2Processor(DataProcessor):
+    """Processor for the LogiQA 2.0 data set."""
+
+    def get_train_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {} train".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "train.txt")), "train")
+
+    def get_train_demos(self, data_dir):  # Eleanor.
+        """See base class."""
+        logger.info("LOOKING AT {} train".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "100_train.txt")), "train")
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {} dev".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.txt")), "dev")
+
+    def get_dev_demos(self, data_dir):  # Eleanor.
+        """See base class."""
+        logger.info("LOOKING AT {} dev".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "100_dev.txt")), "dev")
+
+    def get_test_examples(self, data_dir):
+        logger.info("LOOKING AT {} test".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "test.txt")), "test")
+
+    def get_labels(self):
+        """See base class."""
+        return [0, 1, 2, 3]
+
+    def _read_json(self, input_file):
+        with open(input_file, "r") as f:
+            lines = json.load(f)
+        return lines
+
+    def _read_jsonl(self, input_file):
+        reader = jsonlines.Reader(open(input_file, "r"))
+        lines = [each for each in reader]
+        return lines
+
+    def _create_examples(self, lines, type):
+        """Creates examples for the training and dev sets."""
+        examples = []
+        for d in lines:
+            context = d['text']
+            question = d['question']
+            answers = d['options']
+            label = d['answer'] 
+            id_string = " "
+
+            examples.append(
+                InputExample(
+                    example_id = id_string,
+                    question = question,
+                    contexts=[context, context, context, context],  # this is not efficient but convenient
+                    endings=[answers[0], answers[1], answers[2], answers[3]],
+                    label = label
+                    )
+                )
+        return examples
+
 
 class LogiQAProcessor(DataProcessor):
     """ Processor for the LogiQA data set. """
@@ -594,19 +327,9 @@ class LogiQAProcessor(DataProcessor):
         logger.info("LOOKING AT {} train".format(data_dir))
         return self._create_examples(self._read_txt(os.path.join(data_dir, "Train.txt")), "train")
 
-    def get_train_demos(self, data_dir):  # Eleanor.
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_txt(os.path.join(data_dir, "100_train.txt")), "train")
-
     def get_dev_examples(self, data_dir):
         logger.info("LOOKING AT {} dev".format(data_dir))
         return self._create_examples(self._read_txt(os.path.join(data_dir, "Eval.txt")), "dev")
-
-    def get_dev_demos(self, data_dir):  # Eleanor.
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_txt(os.path.join(data_dir, "100_eval.txt")), "dev")
 
     def get_test_examples(self, data_dir):
         logger.info("LOOKING AT {} test".format(data_dir))
@@ -616,7 +339,7 @@ class LogiQAProcessor(DataProcessor):
         return [0, 1, 2, 3]
 
     def _read_txt(self, input_file):
-        with open(input_file, "r") as f:
+        with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
         return lines
 
@@ -652,26 +375,24 @@ class LogiQAProcessor(DataProcessor):
         return examples
 
 
-def convert_examples_to_features(
+def convert_examples_to_arg_features(
     examples: List[InputExample],
     label_list: List[str],
+    arg_tokenizer,
+    relations: Dict,
+    punctuations: List[str],
     max_length: int,
     tokenizer: PreTrainedTokenizer,
+    max_ngram: int,
 ) -> List[InputFeatures]:
     """
     Loads a data file into a list of `InputFeatures`
-    """
 
-    def preprocess(text, do_lower_case):
-        '''
-        1. correct the types.
-        2. lower.
-        '''
-        output = TextBlob(text).correct()
-        output = str(output)
-        if do_lower_case:
-            output = output.lower()
-        return output
+    context -> chunks of context
+            -> domain_words to Dids
+    option -> chunk of option
+           -> domain_words in Dids
+    """
 
     label_map = {label: i for i, label in enumerate(label_list)}
 
@@ -688,24 +409,8 @@ def convert_examples_to_features(
             else:
                 text_b = example.question + " " + ending
 
-            text_a = preprocess(text_a, False)
-            text_b = preprocess(text_b, False)
-            inputs = tokenizer(
-                text_a,
-                text_b,
-                add_special_tokens=True,
-                max_length=max_length,
-                padding="max_length",
-                truncation=True,
-                return_overflowing_tokens=True,
-            )
-            if "num_truncated_tokens" in inputs and inputs["num_truncated_tokens"] > 0:
-                logger.info(
-                    "Attention! you are cropping tokens (swag task is ok). "
-                    "If you are training ARC and RACE and you are poping question + options,"
-                    "you need to try to use a bigger max seq length!"
-                )
-
+            stopwords = list(gensim.parsing.preprocessing.STOPWORDS) + punctuations
+            inputs = arg_tokenizer(text_a, text_b, tokenizer, stopwords, relations, punctuations, max_ngram, max_length)
             choices_inputs.append(inputs)
 
         label = label_map[example.label]
@@ -714,17 +419,35 @@ def convert_examples_to_features(
         attention_mask = (
             [x["attention_mask"] for x in choices_inputs] if "attention_mask" in choices_inputs[0] else None
         )
-        token_type_ids = (
-            [x["token_type_ids"] for x in choices_inputs] if "token_type_ids" in choices_inputs[0] else None
-        )
+        # token_type_ids = (
+        #     [x["token_type_ids"] for x in choices_inputs] if "token_type_ids" in choices_inputs[0] else None
+        # )
+        a_mask = [x["a_mask"] for x in choices_inputs]
+        b_mask = [x["b_mask"] for x in choices_inputs]  # list[list]
+        argument_bpe_ids = [x["argument_bpe_ids"] for x in choices_inputs]
+        if isinstance(argument_bpe_ids[0], tuple):  # (argument_bpe_pattern_ids, argument_bpe_type_ids)
+            arg_bpe_pattern_ids, arg_bpe_type_ids = [], []
+            for choice_pattern, choice_type in argument_bpe_ids:
+                assert (np.array(choice_pattern) > 0).tolist() == (np.array(choice_type) > 0).tolist(), 'pattern: {}\ntype: {}'.format(
+                    choice_pattern, choice_type)
+                arg_bpe_pattern_ids.append(choice_pattern)
+                arg_bpe_type_ids.append(choice_type)
+            argument_bpe_ids = (arg_bpe_pattern_ids, arg_bpe_type_ids)
+        domain_bpe_ids = [x["domain_bpe_ids"] for x in choices_inputs]
+        punct_bpe_ids = [x["punct_bpe_ids"] for x in choices_inputs]
 
         features.append(
             InputFeatures(
                 example_id=example.example_id,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                label=label,
+                token_type_ids=None,
+                passage_mask=a_mask,
+                question_mask=b_mask,
+                argument_bpe_ids=argument_bpe_ids,
+                domain_bpe_ids=domain_bpe_ids,
+                punct_bpe_ids=punct_bpe_ids,
+                label=label
             )
         )
 
@@ -735,8 +458,10 @@ def convert_examples_to_features(
     return features
 
 
+
+
 processors = {
     # "race": RaceProcessor, "swag": SwagProcessor, "arc": ArcProcessor, "syn": SynonymProcessor,
-              "reclor": ReclorProcessor, "logiqa": LogiQAProcessor,
-              }
-MULTIPLE_CHOICE_TASKS_NUM_LABELS = {"race", 4, "swag", 4, "arc", 4, "syn", 5, "reclor", 4, "logiqa", 4}
+              "reclor": ReclorProcessor, "logiqa": LogiQAProcessor, "logiqa2": LogiQA2Processor}
+MULTIPLE_CHOICE_TASKS_NUM_LABELS = {"race", 4, "swag", 4, "arc", 4, "syn", 5, "reclor", 4, "logiqa", 4, "logiqa2", 4}
+
