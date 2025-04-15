@@ -1,18 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 """ Multiple choice fine-tuning: utilities to work with multiple choice tasks of reading comprehension """
 
 
@@ -31,7 +18,7 @@ from textblob import TextBlob
 import tqdm
 
 from filelock import FileLock
-from transformers import PreTrainedTokenizer, is_tf_available, is_torch_available
+from transformers import PreTrainedTokenizer, is_torch_available
 
 
 logger = logging.getLogger(__name__)
@@ -156,95 +143,6 @@ if is_torch_available():
         def __getitem__(self, i) -> InputFeatures:
             return self.features[i]
 
-
-if is_tf_available():
-    import tensorflow as tf
-
-    class TFMultipleChoiceDataset:
-        """
-        This will be superseded by a framework-agnostic approach
-        soon.
-        """
-
-        features: List[InputFeatures]
-
-        def __init__(
-            self,
-            data_dir: str,
-            tokenizer: PreTrainedTokenizer,
-            task: str,
-            max_seq_length: Optional[int] = 128,
-            overwrite_cache=False,
-            mode: Split = Split.train,
-        ):
-            processor = processors[task]()
-
-            logger.info(f"Creating features from dataset file at {data_dir}")
-            label_list = processor.get_labels()
-            if mode == Split.dev:
-                examples = processor.get_dev_examples(data_dir)
-            elif mode == Split.test:
-                examples = processor.get_test_examples(data_dir)
-            else:
-                examples = processor.get_train_examples(data_dir)
-            logger.info("Training examples: %s", len(examples))
-
-            self.features = convert_examples_to_features(
-                examples,
-                label_list,
-                max_seq_length,
-                tokenizer,
-            )
-
-            def gen():
-                for (ex_index, ex) in tqdm.tqdm(enumerate(self.features), desc="convert examples to features"):
-                    if ex_index % 10000 == 0:
-                        logger.info("Writing example %d of %d" % (ex_index, len(examples)))
-
-                    yield (
-                        {
-                            "example_id": 0,
-                            "input_ids": ex.input_ids,
-                            "attention_mask": ex.attention_mask,
-                            "token_type_ids": ex.token_type_ids,
-                        },
-                        ex.label,
-                    )
-
-            self.dataset = tf.data.Dataset.from_generator(
-                gen,
-                (
-                    {
-                        "example_id": tf.int32,
-                        "input_ids": tf.int32,
-                        "attention_mask": tf.int32,
-                        "token_type_ids": tf.int32,
-                    },
-                    tf.int64,
-                ),
-                (
-                    {
-                        "example_id": tf.TensorShape([]),
-                        "input_ids": tf.TensorShape([None, None]),
-                        "attention_mask": tf.TensorShape([None, None]),
-                        "token_type_ids": tf.TensorShape([None, None]),
-                    },
-                    tf.TensorShape([]),
-                ),
-            )
-
-        def get_dataset(self):
-            self.dataset = self.dataset.apply(tf.data.experimental.assert_cardinality(len(self.features)))
-
-            return self.dataset
-
-        def __len__(self):
-            return len(self.features)
-
-        def __getitem__(self, i) -> InputFeatures:
-            return self.features[i]
-
-
 class DataProcessor:
     """Base class for data converters for multiple choice data sets."""
 
@@ -263,262 +161,6 @@ class DataProcessor:
     def get_labels(self):
         """Gets the list of labels for this data set."""
         raise NotImplementedError()
-
-
-class RaceProcessor(DataProcessor):
-    """Processor for the RACE data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        high = os.path.join(data_dir, "train/high")
-        middle = os.path.join(data_dir, "train/middle")
-        high = self._read_txt(high)
-        middle = self._read_txt(middle)
-        return self._create_examples(high + middle, "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        high = os.path.join(data_dir, "dev/high")
-        middle = os.path.join(data_dir, "dev/middle")
-        high = self._read_txt(high)
-        middle = self._read_txt(middle)
-        return self._create_examples(high + middle, "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} test".format(data_dir))
-        high = os.path.join(data_dir, "test/high")
-        middle = os.path.join(data_dir, "test/middle")
-        high = self._read_txt(high)
-        middle = self._read_txt(middle)
-        return self._create_examples(high + middle, "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3"]
-
-    def _read_txt(self, input_dir):
-        lines = []
-        files = glob.glob(input_dir + "/*txt")
-        for file in tqdm.tqdm(files, desc="read files"):
-            with open(file, "r", encoding="utf-8") as fin:
-                data_raw = json.load(fin)
-                data_raw["race_id"] = file
-                lines.append(data_raw)
-        return lines
-
-    def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
-        examples = []
-        for (_, data_raw) in enumerate(lines):
-            race_id = "%s-%s" % (set_type, data_raw["race_id"])
-            article = data_raw["article"]
-            for i in range(len(data_raw["answers"])):
-                truth = str(ord(data_raw["answers"][i]) - ord("A"))
-                question = data_raw["questions"][i]
-                options = data_raw["options"][i]
-
-                examples.append(
-                    InputExample(
-                        example_id=race_id,
-                        question=question,
-                        contexts=[article, article, article, article],  # this is not efficient but convenient
-                        endings=[options[0], options[1], options[2], options[3]],
-                        label=truth,
-                    )
-                )
-        return examples
-
-
-class SynonymProcessor(DataProcessor):
-    """Processor for the Synonym data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "mctrain.csv")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "mchp.csv")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "mctest.csv")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3", "4"]
-
-    def _read_csv(self, input_file):
-        with open(input_file, "r", encoding="utf-8") as f:
-            return list(csv.reader(f))
-
-    def _create_examples(self, lines: List[List[str]], type: str):
-        """Creates examples for the training and dev sets."""
-
-        examples = [
-            InputExample(
-                example_id=line[0],
-                question="",  # in the swag dataset, the
-                # common beginning of each
-                # choice is stored in "sent2".
-                contexts=[line[1], line[1], line[1], line[1], line[1]],
-                endings=[line[2], line[3], line[4], line[5], line[6]],
-                label=line[7],
-            )
-            for line in lines  # we skip the line with the column names
-        ]
-
-        return examples
-
-
-class SwagProcessor(DataProcessor):
-    """Processor for the SWAG data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.csv")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "val.csv")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        raise ValueError(
-            "For swag testing, the input file does not contain a label column. It can not be tested in current code"
-            "setting!"
-        )
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.csv")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3"]
-
-    def _read_csv(self, input_file):
-        with open(input_file, "r", encoding="utf-8") as f:
-            return list(csv.reader(f))
-
-    def _create_examples(self, lines: List[List[str]], type: str):
-        """Creates examples for the training and dev sets."""
-        if type == "train" and lines[0][-1] != "label":
-            raise ValueError("For training, the input file must contain a label column.")
-
-        examples = [
-            InputExample(
-                example_id=line[2],
-                question=line[5],  # in the swag dataset, the
-                # common beginning of each
-                # choice is stored in "sent2".
-                contexts=[line[4], line[4], line[4], line[4]],
-                endings=[line[7], line[8], line[9], line[10]],
-                label=line[11],
-            )
-            for line in lines[1:]  # we skip the line with the column names
-        ]
-
-        return examples
-
-
-class ArcProcessor(DataProcessor):
-    """Processor for the ARC data set (request from allennlp)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} train".format(data_dir))
-        return self._create_examples(self._read_json(os.path.join(data_dir, "train.jsonl")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        logger.info("LOOKING AT {} dev".format(data_dir))
-        return self._create_examples(self._read_json(os.path.join(data_dir, "dev.jsonl")), "dev")
-
-    def get_test_examples(self, data_dir):
-        logger.info("LOOKING AT {} test".format(data_dir))
-        return self._create_examples(self._read_json(os.path.join(data_dir, "test.jsonl")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["0", "1", "2", "3"]
-
-    def _read_json(self, input_file):
-        with open(input_file, "r", encoding="utf-8") as fin:
-            lines = fin.readlines()
-            return lines
-
-    def _create_examples(self, lines, type):
-        """Creates examples for the training and dev sets."""
-
-        # There are two types of labels. They should be normalized
-        def normalize(truth):
-            if truth in "ABCD":
-                return ord(truth) - ord("A")
-            elif truth in "1234":
-                return int(truth) - 1
-            else:
-                logger.info("truth ERROR! %s", str(truth))
-                return None
-
-        examples = []
-        three_choice = 0
-        four_choice = 0
-        five_choice = 0
-        other_choices = 0
-        # we deleted example which has more than or less than four choices
-        for line in tqdm.tqdm(lines, desc="read arc data"):
-            data_raw = json.loads(line.strip("\n"))
-            if len(data_raw["question"]["choices"]) == 3:
-                three_choice += 1
-                continue
-            elif len(data_raw["question"]["choices"]) == 5:
-                five_choice += 1
-                continue
-            elif len(data_raw["question"]["choices"]) != 4:
-                other_choices += 1
-                continue
-            four_choice += 1
-            truth = str(normalize(data_raw["answerKey"]))
-            assert truth != "None"
-            question_choices = data_raw["question"]
-            question = question_choices["stem"]
-            id = data_raw["id"]
-            options = question_choices["choices"]
-            if len(options) == 4:
-                examples.append(
-                    InputExample(
-                        example_id=id,
-                        question=question,
-                        contexts=[
-                            options[0]["para"].replace("_", ""),
-                            options[1]["para"].replace("_", ""),
-                            options[2]["para"].replace("_", ""),
-                            options[3]["para"].replace("_", ""),
-                        ],
-                        endings=[options[0]["text"], options[1]["text"], options[2]["text"], options[3]["text"]],
-                        label=truth,
-                    )
-                )
-
-        if type == "train":
-            assert len(examples) > 1
-            assert examples[0].label is not None
-        logger.info("len examples: %s}", str(len(examples)))
-        logger.info("Three choices: %s", str(three_choice))
-        logger.info("Five choices: %s", str(five_choice))
-        logger.info("Other choices: %s", str(other_choices))
-        logger.info("four choices: %s", str(four_choice))
-
-        return examples
-
 
 class ReclorProcessor(DataProcessor):
     """Processor for the ReClor data set."""
@@ -651,6 +293,68 @@ class LogiQAProcessor(DataProcessor):
         assert len(examples) == n_examples
         return examples
 
+class LogiQA2Processor(DataProcessor):
+    """Processor for the LogiQA 2.0 data set."""
+
+    def get_train_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {} train".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "train.txt")), "train")
+
+    def get_train_demos(self, data_dir):  # Eleanor.
+        """See base class."""
+        logger.info("LOOKING AT {} train".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "100_train.txt")), "train")
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {} dev".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.txt")), "dev")
+
+    def get_dev_demos(self, data_dir):  # Eleanor.
+        """See base class."""
+        logger.info("LOOKING AT {} dev".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "100_dev.txt")), "dev")
+
+    def get_test_examples(self, data_dir):
+        logger.info("LOOKING AT {} test".format(data_dir))
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "test.txt")), "test")
+
+    def get_labels(self):
+        """See base class."""
+        return [0, 1, 2, 3]
+
+    def _read_json(self, input_file):
+        with open(input_file, "r") as f:
+            lines = json.load(f)
+        return lines
+
+    def _read_jsonl(self, input_file):
+        reader = jsonlines.Reader(open(input_file, "r"))
+        lines = [each for each in reader]
+        return lines
+
+    def _create_examples(self, lines, type):
+        """Creates examples for the training and dev sets."""
+        examples = []
+        for d in lines:
+            context = d['text']
+            question = d['question']
+            answers = d['options']
+            label = d['answer'] 
+            id_string = " "
+
+            examples.append(
+                InputExample(
+                    example_id = id_string,
+                    question = question,
+                    contexts=[context, context, context, context],  # this is not efficient but convenient
+                    endings=[answers[0], answers[1], answers[2], answers[3]],
+                    label = label
+                    )
+                )
+        return examples
+
 
 def convert_examples_to_features(
     examples: List[InputExample],
@@ -737,6 +441,6 @@ def convert_examples_to_features(
 
 processors = {
     # "race": RaceProcessor, "swag": SwagProcessor, "arc": ArcProcessor, "syn": SynonymProcessor,
-              "reclor": ReclorProcessor, "logiqa": LogiQAProcessor,
+              "reclor": ReclorProcessor, "logiqa": LogiQAProcessor, "logiqa2": LogiQA2Processor
               }
-MULTIPLE_CHOICE_TASKS_NUM_LABELS = {"race", 4, "swag", 4, "arc", 4, "syn", 5, "reclor", 4, "logiqa", 4}
+MULTIPLE_CHOICE_TASKS_NUM_LABELS = {"race", 4, "swag", 4, "arc", 4, "syn", 5, "reclor", 4, "logiqa", 4, "logiqa2", 4}

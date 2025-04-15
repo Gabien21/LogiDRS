@@ -1,25 +1,4 @@
 ''' encoding=utf-8
-
-Data processing Version 3.2
-
-Date: 10/11/2020
-Author: Yinya Huang
-
-* argument words: pre-defined relations.
-* domain words: repeated n-gram.
-
-
-* relations patterns:
-    1 - (relation, head, tail)  关键词在句首
-    2 - (head, relation, tail)  关键词在句中，先因后果
-    3 - (tail, relation, head)  关键词在句中，先果后因
-
-
-== graph ==
-    * edges: periods.
-    * edges: argument words.
-    * nodes: chunks split by periods & argument words.
-
 '''
 
 from dataclasses import dataclass, field

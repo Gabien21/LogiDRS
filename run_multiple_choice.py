@@ -1,18 +1,4 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """ Finetuning the library models for multiple choice (Bert, Roberta, XLNet)."""
 
 
@@ -41,8 +27,8 @@ from torch.utils.data import Subset
 from utils_multiple_choice import processors
 from collections import Counter
 
-from dagn2 import DAGN
-from tokenization_dagn import arg_tokenizer
+from logidrs import LogiDRS
+from tokenization_logidrs import arg_tokenizer
 # from utils_multiple_choice import Split, MyMultipleChoiceDataset
 from graph_building_blocks.argument_set_punctuation_v4 import punctuations
 with open('./graph_building_blocks/explicit_arg_set_v4.json', 'r') as f:
@@ -51,45 +37,6 @@ with open('./graph_building_blocks/explicit_arg_set_v4.json', 'r') as f:
 
 
 logger = logging.getLogger(__name__)
-
-
-class TestEvaluationCallback(TrainerCallback):
-    def __init__(self, trainer, test_dataset, output_dir, task_name):
-        self.trainer = trainer
-        self.test_dataset = test_dataset
-        self.output_dir = output_dir
-        self.task_name = task_name
-
-    def on_epoch_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
-        """Gọi sau mỗi epoch. Nếu epoch >= 10, thực hiện dự đoán trên test set."""
-        # if state.epoch >= 10:
-        if True:
-            print(f"\n[Epoch {state.epoch}] Running test evaluation for {self.task_name}...\n")
-            
-            test_result = self.trainer.predict(self.test_dataset)
-            preds = test_result.predictions
-            pred_ids = np.argmax(preds, axis=1)
-
-            output_epoch_path = os.path.join(self.output_dir, f"test_predictions_epoch_{int(state.epoch)}")
-
-            if self.task_name == "reclor":
-                # Lưu predictions dưới dạng .npy
-                np.save(f"{output_epoch_path}.npy", pred_ids)
-                print(f"ReClor predictions for epoch {int(state.epoch)} saved to {output_epoch_path}.npy")
-
-            elif self.task_name in ["logiqa", "logiqa2"]:
-                # Lưu kết quả test dưới dạng file text
-                output_test_file = f"{output_epoch_path}_results.txt"
-                with open(output_test_file, "w") as writer:
-                    for key, value in test_result.metrics.items():
-                        writer.write(f"{key} = {value}\n")
-                print(f"{self.task_name} results for epoch {int(state.epoch)} saved to {output_test_file}")
-
-            else:
-                print(f"⚠ Warning: Task {self.task_name} is not explicitly handled. Saving generic results.")
-                np.save(f"{output_epoch_path}.npy", pred_ids)
-
-
 
 def simple_accuracy(preds, labels):
     return (preds == labels).mean()
@@ -115,44 +62,15 @@ class ModelArguments:
     )
     model_type: str = field(
         metadata={"help": "Model types: roberta_large | argument_numnet | ..."},
-        default="DAGN"
-    )
-    merge_type: int = field(
-        default=1,
-        metadata={"help": "The way gcn_feats and baseline_feats are merged."}
-    )
-    gnn_version: str = field(
-        default="",
-        metadata={"help": "GNN version in myutil.py or myutil_gat.py"
-                          "value = GCN|GCN_reversededges|GCN_reversededges_double"}
-    )
-    model_branch: bool = field(
-        default=False,
-        metadata={"help": "add model branch according to grouped_question_type"}
-    )
-    model_version: int = field(
-        default=1,
-        metadata={"help": "argument numnet evolving version."}
-    )
-    use_gcn: bool = field(
-        default=False,
-        metadata={"help": "Use GCN in model or not."}
+        default="LogiDRS"
     )
     use_discourse: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Use discourse information in model or not."}
     )
-    use_transformer: bool = field(
+    n_transformer_layer: bool = field(
         default=False,
-        metadata={"help": "Use transformer information in model or not."}
-    )
-    use_pool: bool = field(
-        default=False,
-        metadata={"help": "Use pooled_output branch in model or not."}
-    )
-    gcn_steps: int = field(
-        default=1,
-        metadata={"help": "GCN iteration steps"}
+        metadata={"help": "n_transformer_layer information in model."}
     )
     attention_drop: float = field(
         default=0.1,
@@ -176,16 +94,14 @@ class ModelArguments:
         default=5e-6,
         metadata={"help": "learning rate for updating roberta parameters"}
     )
-    gcn_lr: float = field(
+    discourse_lr: float = field(
         default=5e-6,
-        metadata={"help": "learning rate for updating gcn parameters"}
+        metadata={"help": "learning rate for updating discourse parameters"}
     )
-    proj_lr: float = field(
+    transformer_lr: float = field(
         default=5e-6,
-        metadata={"help": "learning rate for updating fc parameters"}
+        metadata={"help": "learning rate for updating transformer parameters"}
     )
-
-
 
 @dataclass
 class DataTrainingArguments:
@@ -234,10 +150,6 @@ class DataTrainingArguments:
 
 
 def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -349,28 +261,25 @@ def main():
             if training_args.do_predict
             else None
         )
-    elif model_args.model_type == "DAGN":
+    elif model_args.model_type == "LogiDRS":
         from utils_multiple_choice import Split, MyMultipleChoiceDataset
         training_args.report_to = []
        
-        model = DAGN.from_pretrained(
+        model = LogiDRS.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
             token_encoder_type="roberta" if "roberta" in model_args.model_name_or_path else "bert",
             init_weights=model_args.init_weights,
             max_rel_id=max_rel_id,
-            merge_type=model_args.merge_type,
-            gnn_version=model_args.gnn_version,
             cache_dir=model_args.cache_dir,
             hidden_size=config.hidden_size,
             dropout_prob=model_args.numnet_drop,
             use_discourse=model_args.use_discourse,
-            use_transformer=model_args.use_transformer,
-            use_gcn=model_args.use_gcn,
-            use_pool=model_args.use_pool,
-            gcn_steps=model_args.gcn_steps
+            n_transformer_layer=model_args.n_transformer_layer,
         )
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Number of parameters of model: {total_params}")
 
         train_dataset = (
             MyMultipleChoiceDataset(
@@ -428,10 +337,6 @@ def main():
             if training_args.do_predict
             else None
         )
-        train_dataset = Subset(train_dataset, range(10))
-        eval_dataset = Subset(eval_dataset, range(10))
-        test_dataset = Subset(test_dataset, range(10))
-
     else:
         raise Exception
 
@@ -443,23 +348,10 @@ def main():
         return {"acc": simple_accuracy(preds, p.label_ids)}
 
 
-    if model_args.use_gcn:
+    if model_args.use_discourse:
         no_decay = ["bias", "LayerNorm.weight"]
-        # model = model_init()
         optimizer_grouped_parameters = [
             {
-                "params": [p for n, p in model.named_parameters() if n.startswith("_gcn")
-                           and not any(nd in n for nd in no_decay)],
-                "lr": model_args.gcn_lr,
-                "weight_decay": training_args.weight_decay,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if n.startswith("_gcn")
-                           and any(nd in n for nd in no_decay)],
-                "lr": model_args.gcn_lr,
-                "weight_decay": 0.0,
-            },
-            {
                 "params": [p for n, p in model.named_parameters() if n.startswith("roberta")
                            and not any(nd in n for nd in no_decay)],
                 "lr": model_args.roberta_lr,
@@ -472,39 +364,27 @@ def main():
                 "weight_decay": 0.0,
             },
             {
-                "params": [p for n, p in model.named_parameters() if n.startswith("_proj")
-                           and not any(nd in n for nd in no_decay)],
-                "lr": model_args.proj_lr,
-                "weight_decay": training_args.weight_decay,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if n.startswith("_proj")
-                           and any(nd in n for nd in no_decay)],
-                "lr": model_args.proj_lr,
-                "weight_decay": 0.0,
-            },
-            {
                 "params": [p for n, p in model.named_parameters() if n.startswith("_discourse")
                            and not any(nd in n for nd in no_decay)],
-                "lr": model_args.proj_lr,
+                "lr": model_args.discourse_lr,
                 "weight_decay": training_args.weight_decay,
             },
             {
                 "params": [p for n, p in model.named_parameters() if n.startswith("_discourse")
                            and any(nd in n for nd in no_decay)],
-                "lr": model_args.proj_lr,
+                "lr": model_args.discourse_lr,
                 "weight_decay": 0.0,
             },
             {
                 "params": [p for n, p in model.named_parameters() if n.startswith("_transformer")
                            and not any(nd in n for nd in no_decay)],
-                "lr": model_args.proj_lr,
+                "lr": model_args.transformer_lr,
                 "weight_decay": training_args.weight_decay,
             },
             {
                 "params": [p for n, p in model.named_parameters() if n.startswith("_transformer")
                            and any(nd in n for nd in no_decay)],
-                "lr": model_args.proj_lr,
+                "lr": model_args.transformer_lr,
                 "weight_decay": 0.0,
             }
         ]
@@ -518,7 +398,7 @@ def main():
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             compute_metrics=compute_metrics,
-            optimizers=(optimizer, None),
+            optimizers=(optimizer, None)
         )
     else:
         trainer = Trainer(
@@ -528,18 +408,13 @@ def main():
             eval_dataset=eval_dataset,
             compute_metrics=compute_metrics,
         )
-    
-    trainer.add_callback(TestEvaluationCallback(trainer, test_dataset, training_args.output_dir, data_args.task_name))
-    
+
     # Training
     if training_args.do_train:
         trainer.train(
             model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None
         )
-        # trainer.save_model()
-        trainer_state_path = os.path.join(training_args.output_dir, "trainer_state.json")
-        trainer.state.save_to_json(trainer_state_path)
-        print(f"Trainer state saved to {trainer_state_path}")
+        trainer.save_model()
         # For convenience, we also re-save the tokenizer to the same directory,
         # so that you can share your model easily on huggingface.co/models =)
         if trainer.is_world_process_zero():
@@ -562,93 +437,6 @@ def main():
 
                 results.update(result)
 
-    def test_all_checkpoints(output_dir, trainer, test_dataset, model_type="DAGN"):
-        """
-        Function to evaluate all checkpoints saved in the output directory.
-        """
-        # Lấy danh sách tất cả các checkpoints trong output_dir
-        checkpoints = sorted(
-            [os.path.join(output_dir, ckpt) for ckpt in os.listdir(output_dir) if ckpt.startswith("checkpoint-")],
-            key=lambda x: int(x.split("-")[-1])  # Sắp xếp theo số bước (epoch/step)
-        )
-
-        results = {}
-
-        # Lặp qua từng checkpoint và đánh giá
-        for checkpoint in checkpoints:
-            checkpoint_name = os.path.basename(checkpoint)  # Lấy tên checkpoint
-            print(f"Loading model from {checkpoint}")
-
-            # Load model tương ứng
-            if model_type == "PLM":
-                model = AutoModelForMultipleChoice.from_pretrained(
-                    model_args.model_name_or_path,
-                    from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                    config=config,
-                    cache_dir=model_args.cache_dir,
-                )
-            else:  # Model DAGN
-                model = DAGN.from_pretrained(
-                    checkpoint,
-                    from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                    config=config,
-                    token_encoder_type="roberta" if "roberta" in model_args.model_name_or_path else "bert",
-                    init_weights=model_args.init_weights,
-                    max_rel_id=max_rel_id,
-                    merge_type=model_args.merge_type,
-                    gnn_version=model_args.gnn_version,
-                    cache_dir=model_args.cache_dir,
-                    hidden_size=config.hidden_size,
-                    dropout_prob=model_args.numnet_drop,
-                    use_discourse=model_args.use_discourse,
-                    use_transformer=model_args.use_transformer,
-                    use_gcn=model_args.use_gcn,
-                    use_pool=model_args.use_pool,
-                    gcn_steps=model_args.gcn_steps
-                )
-            print("this is model------------------------------------")
-            print(model)
-            print("this is model------------------------------------")
-            trainer.model = model  # Cập nhật model cho trainer
-            model.to(training_args.device)
-
-            print(f"*** Evaluating {checkpoint} ***")
-            # eval_result = trainer.predict(eval_dataset)  # Đánh giá
-            # print(eval_result.metrics)
-
-            # Trường hợp đặc biệt cho task "reclor"
-            if data_args.task_name == "reclor":
-                test_result = trainer.predict(test_dataset)
-                preds = test_result.predictions  
-                pred_ids = np.argmax(preds, axis=1)
-
-                # Lưu predictions với task_name và checkpoint
-                output_test_file = os.path.join(
-                    checkpoint, f"{os.path.basename(os.path.dirname(training_args.output_dir))}_{checkpoint_name}_predictions.npy"
-                )
-                np.save(output_test_file, pred_ids)
-                print(f"Predictions for {checkpoint} saved to {output_test_file}")
-
-            else:
-                # Trường hợp thông thường
-                test_result = trainer.predict(test_dataset)
-
-                # Lưu kết quả đánh giá với task_name và checkpoint
-                output_test_file = os.path.join(
-                    checkpoint, f"{os.path.basename(os.path.dirname(training_args.output_dir))}_{checkpoint_name}_test_results.txt"
-                )
-                with open(output_test_file, "w") as writer:
-                    for key, value in test_result.metrics.items():
-                        writer.write(f"{key} = {value}\n")
-                print(f"Results for {checkpoint} saved to {output_test_file}")
-
-                # Lưu kết quả vào dict
-                results[f"{os.path.basename(os.path.dirname(training_args.output_dir))}_{checkpoint_name}"] = test_result.metrics
-
-        return results
-
-
-
     # Test
     if training_args.do_predict:
         if data_args.task_name == "reclor":
@@ -666,8 +454,8 @@ def main():
 
             test_result = trainer.predict(test_dataset)
 
-            output_test_file = os.path.join(training_args.output_dir, f"{os.path.basename(os.path.dirname(training_args.output_dir))}test_results.txt")
-            if trainer.is_world_process_zero():
+            output_test_file = os.path.join(training_args.output_dir, "test_results.txt")
+            if trainer.is_local_process_zero():
                 with open(output_test_file, "w") as writer:
                     logger.info("***** Test results *****")
                     for key, value in test_result.metrics.items():
@@ -675,24 +463,6 @@ def main():
                         writer.write("%s = %s\n" % (key, value))
 
                     results.update(test_result.metrics)
-
-            
-        print("Testing all checkpoints...")
-        all_results = test_all_checkpoints(training_args.output_dir, trainer, test_dataset, model_args.model_type)
-        if data_args.task_name != "reclor":
-            test_acc_results = {checkpoint: metrics["test_acc"] for checkpoint, metrics in all_results.items()}
-            output_acc_file = os.path.join(training_args.output_dir, "all_checkpoints_test_acc.json")
-            with open(output_acc_file, "w") as f:
-                json.dump(test_acc_results, f, indent=4)
-        print("All checkpoint results:", all_results)
-            
-    try:
-        output_image_file = os.path.join(training_args.output_dir, os.path.basename(os.path.dirname(training_args.output_dir))+".png")
-        plot_image(training_args.output_dir, output_image_file)
-        print(f"Result saved to {output_image_file}")
-    except Exception as e:
-        print(e)
-
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)

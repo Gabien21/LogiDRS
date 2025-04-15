@@ -1,11 +1,4 @@
 # -*- coding: UTF-8 -*-
-'''
-DAGN Version 2.1.3.2
-
-Adapted from: https://github.com/llamazing/numnet_plus
-Date: 8/11/2020
-Author: Yinya Huang
-'''
 
 import torch
 import torch.nn as nn
@@ -15,11 +8,10 @@ from typing import List, Dict, Any, Tuple
 from itertools import groupby
 from operator import itemgetter
 import copy
-from util import FFNLayer, ResidualGRU, ArgumentGCN, ArgumentGCN_wreverseedges_double
-from tools import allennlp as util
 from transformers import BertPreTrainedModel, RobertaModel, BertModel
 from attention import TransformerLayer
 
+# Simple linear classification head
 class ClassificationHead(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(ClassificationHead, self).__init__()
@@ -28,28 +20,9 @@ class ClassificationHead(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-class DAGN(BertPreTrainedModel):
+class LogiDRS(BertPreTrainedModel):
     '''
-    Adapted from https://github.com/llamazing/numnet_plus.
-
-    Inputs of forward(): see try_data_5.py - the outputs of arg_tokenizer()
-        - input_ids: list[int]
-        - attention_mask: list[int]
-        - segment_ids: list[int]
-        - argument_bpe_ids: list[int]. value={ -1: padding,
-                                                0: non_arg_non_dom,
-                                                1: (relation, head, tail)  关键词在句首
-                                                2: (head, relation, tail)  关键词在句中，先因后果
-                                                3: (tail, relation, head)  关键词在句中，先果后因
-                                                }
-        - domain_bpe_ids: list[int]. value={ -1: padding,
-                                              0:non_arg_non_dom,
-                                           D_id: domain word ids.}
-        - punctuation_bpe_ids: list[int]. value={ -1: padding,
-                                                   0: non_punctuation,
-                                                   1: punctuation}
-
-
+    LogiDRS model customized for logical reasoning and discourse-aware modeling, using discourse relation sense information.
     '''
 
     def __init__(self,
@@ -58,36 +31,24 @@ class DAGN(BertPreTrainedModel):
                  max_rel_id,
                  hidden_size: int,
                  dropout_prob: float = 0.1,
-                 merge_type: int = 1,
                  token_encoder_type: str = "roberta",
-                 gnn_version: str = "GCN",
-                 use_pool: bool = False,
-                 use_gcn: bool = False,
                  use_discourse: bool = False,
-                 use_transformer: bool = False,
-                 n_transformer_layer: int = 2,
-                 gcn_steps: int=1) -> None:
+                 n_transformer_layer: int = 2
+                ) -> None:
         super().__init__(config)
 
         self.token_encoder_type = token_encoder_type
         self.max_rel_id = max_rel_id
-        self.merge_type = merge_type
-        self.use_gcn = use_gcn
         self.use_discourse = use_discourse
-        self.use_transformer = use_transformer
         self.n_transformer_layer = n_transformer_layer
-        self.use_pool = use_pool
-        assert self.use_gcn or self.use_pool
 
-        ''' from modeling_roberta '''
+        # Load pretrained Roberta model
         self.roberta = RobertaModel(config)
 
         # for param in self.roberta.parameters():
         #     param.requires_grad = False
 
-        #--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-        ''' from classification head of pretrained model on PDTB2.0 '''
+        # Discourse classification head from external pretrained layers
         if self.use_discourse:
             self._discourse_classification_head = ClassificationHead(input_dim=config.hidden_size, output_dim=23)
             state_dict = torch.load("classification_head/custom_layers.pth")
@@ -95,49 +56,29 @@ class DAGN(BertPreTrainedModel):
             self._discourse_classification_head.linear.load_state_dict(state_dict["classification_head"]) 
             self._discourse_dropout2 = nn.Dropout(config.hidden_dropout_prob)
 
-            # for param in self._discourse_classification_head.parameters():
-            #     param.requires_grad = False
+            for param in self._discourse_classification_head.parameters():
+                param.requires_grad = False
 
             self._discourse_information_transform = nn.Linear(config.hidden_size + 23, config.hidden_size) # 23 is the number of classes in PDTB2.0
 
-        if self.use_transformer:
-            # MultiHeadAttention Layer
-            self.num_heads = 4
-            self.ff_hidden_size = config.hidden_size*2
+        # Custom transformer layer
+        self.num_heads = 4
+        self.ff_hidden_size = config.hidden_size * 2
+        self.n_layers = self.n_transformer_layer
+        self._transformer_block = TransformerLayer(self.n_layers,config.hidden_size, self.num_heads, self.ff_hidden_size,dropout = config.hidden_dropout_prob, max_len=64)
         
-            self.n_layers = 1
-            self._transformer_block = TransformerLayer(self.n_layers,config.hidden_size, self.num_heads, self.ff_hidden_size,dropout = config.hidden_dropout_prob, max_len=256)
-            # Linear Projection Layer and Classfication Head
-            if self.use_discourse == False and self.use_transformer == False:
-                self._transformer_linear_projection = nn.Linear(config.hidden_size * 2 , config.hidden_size)
-            else:
-                self._transformer_linear_projection = nn.Linear(config.hidden_size * 3 , config.hidden_size)
-            self._transformer_dropout = nn.Dropout(config.hidden_dropout_prob)
-            self._transformer_classifier = nn.Linear(config.hidden_size,1)
-        #--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-        if self.use_pool:
-            self.dropout = nn.Dropout(config.hidden_dropout_prob)
-            self.classifier = nn.Linear(config.hidden_size, 1)
-
+        # Linear Projection Layer and Classfication Head
+        if self.use_discourse == False:
+            self._transformer_linear_projection = nn.Linear(config.hidden_size * 2 , config.hidden_size)
+        else:
+            self._transformer_linear_projection = nn.Linear(config.hidden_size * 3 , config.hidden_size)
+        self._transformer_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self._transformer_classifier = nn.Linear(config.hidden_size,1)
         if init_weights:
             self.init_weights()
 
 
     def split_into_spans_9(self, seq, seq_mask, split_bpe_ids):
-        '''
-
-            :param seq: (bsz, seq_length, embed_size)
-            :param seq_mask: (bsz, seq_length)
-            :param split_bpe_ids: (bsz, seq_length). value = {-1, 0, 1, 2, 3, 4}.
-            :return:
-                - encoded_spans: (bsz, n_nodes, embed_size)
-                - span_masks: (bsz, n_nodes)
-                - edges: (bsz, n_nodes - 1)
-                - node_in_seq_indices: list of list of list(len of span).
-
-        '''
-
         def _consecutive(seq: list, vals: np.array):
             groups_seq = []
             output_vals = copy.deepcopy(vals)
@@ -188,14 +129,11 @@ class DAGN(BertPreTrainedModel):
                 split_ids_indices, item_split_ids)
             n_split_ids = len(split_ids_indices)
 
-
-
             #--------------------------Discourse Info--------------------------
             edges_embedings = torch.zeros(len(grouped_split_ids_indices[1:-1]), embed_size, device=seq.device)
             for i, idxs in enumerate(grouped_split_ids_indices[1:-1]):
                 span = item_seq[idxs]
                 if len(span) != 0:
-
                     edges_embedings[i] = span.sum(0)
 
             if self.use_discourse:
@@ -208,12 +146,12 @@ class DAGN(BertPreTrainedModel):
                         punct_idx_list.append(i)
     
                 sequence_discourse_span = torch.zeros(len(grouped_split_ids_indices[1:-1]), embed_size, device=seq.device)
+
                 for i in range(1, len(grouped_split_ids_indices)-1):
                     if grouped_split_ids_indices[i] in punct_idx_list:
                         start = punct_idx_list[punct_idx_list.index(grouped_split_ids_indices[i])-1]
                         end = punct_idx_list[punct_idx_list.index(grouped_split_ids_indices[i])+1]
                     else:
-                        
                         start = grouped_split_ids_indices[i-1]
                         end = grouped_split_ids_indices[i+1]
                     if i+1 < len(grouped_split_ids_indices) and  grouped_split_ids_indices[i+1] not in punct_idx_list:
@@ -303,8 +241,6 @@ class DAGN(BertPreTrainedModel):
         encoded_sents = [torch.stack(lst, dim=0) for lst in encoded_sents]
         encoded_sents = torch.stack(encoded_sents, dim=0)
         encoded_sents = encoded_sents.to(device).float()
-        # Truncate head and tail of each list in edges HERE.
-        #     Because the head and tail edge DO NOT contribute to the argument graph and punctuation graph.
         truncated_edges = [item[1:-1] for item in edges]
 
         return encoded_spans, span_masks, truncated_edges, node_in_seq_indices, encoded_edges, encoded_sents
@@ -396,8 +332,11 @@ class DAGN(BertPreTrainedModel):
         flat_attention_mask = attention_mask.view(-1, attention_mask.size(-1)) if attention_mask is not None else None
         flat_token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1)) if token_type_ids is not None else None
 
+        flat_passage_mask = passage_mask.view(-1, passage_mask.size(-1)) if passage_mask is not None else None
+        flat_question_mask = question_mask.view(-1, question_mask.size(-1)) if question_mask is not None else None
 
         flat_argument_bpe_ids = argument_bpe_ids.view(-1, argument_bpe_ids.size(-1)) if argument_bpe_ids is not None else None
+        flat_domain_bpe_ids = domain_bpe_ids.view(-1, domain_bpe_ids.size(-1)) if domain_bpe_ids is not None else None  
         flat_punct_bpe_ids = punct_bpe_ids.view(-1, punct_bpe_ids.size(-1)) if punct_bpe_ids is not None else None
 
         bert_outputs = self.roberta(flat_input_ids, attention_mask=flat_attention_mask, token_type_ids=None)
@@ -421,16 +360,18 @@ class DAGN(BertPreTrainedModel):
                                                                                                         flat_attention_mask,
                                                                                                         flat_all_bpe_ids)
 
-        if self.use_discourse == False and self.use_transformer == False:
+        # Basic fusion of pooled output and sequence average (no discourse)
+        if self.use_discourse == False:
             total_output = torch.cat((pooled_output,torch.mean(sequence_output,dim=1)),dim=1)
 
-        elif self.use_transformer == True:
-            attention_output = self._transformer_block(encoded_sents)
-            atom_output = torch.mean(attention_output,dim=1)
-            total_output = torch.cat((pooled_output, torch.mean(sequence_output,dim=1), atom_output),dim=1)
+        # Apply transformer to span-level embeddings 
+        attention_output = self._transformer_block(encoded_sents)
+        atom_output = torch.mean(attention_output,dim=1)
+
+        # Concatenate all representation vectors
+        total_output = torch.cat((pooled_output, torch.mean(sequence_output,dim=1), atom_output),dim=1)
     
-
-
+         # Final classification head
         linear_prj = self._transformer_linear_projection(total_output)
         linear_prj = self._transformer_dropout(linear_prj)
         logits = self._transformer_classifier(linear_prj)
