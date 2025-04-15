@@ -36,4 +36,4 @@ sh run_logidrs.sh
 ```
 ---
 ## 🙏 Acknowledgement
-The implementation of LogiDRS is inspired by [DAGN](https://github.com/Eleanor-H/DAGN) and supported by [Huggingface Toolkit](https://huggingface.co/docs/transformers).
+The implementation of LogiDRS is inspired by [DAGN](https://github.com/Eleanor-H/DAGN) and supported by [Huggingface Toolkit](https://huggingface.co/docs/transformers). This research is funded by University of Science, VNU-HCM under grant number CNTT 2024-17. This research used the GPUs provided by the Intelligent Systems Lab at the Faculty of Information Technology, University of Science,VNU-HCM. Moreover,the datasets [PDTB 2.0](https://catalog.ldc.upenn.edu/LDC2008T05) used in this study were generously supported by the Linguistic Data Consortium (LDC).
